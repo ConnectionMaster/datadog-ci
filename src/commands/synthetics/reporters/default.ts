@@ -1,4 +1,5 @@
 import chalk from 'chalk'
+import {Writable} from 'stream'
 
 import {
   Assertion,
@@ -7,11 +8,14 @@ import {
   LocationsMapping,
   Operator,
   PollResult,
+  Reporter,
   Result,
   Step,
+  Summary,
   Test,
-} from './interfaces'
-import {hasResultPassed, hasTestSucceeded} from './utils'
+} from '../interfaces'
+import {RunTestCommand} from '../run-test'
+import {hasResultPassed, hasTestSucceeded} from '../utils'
 
 // Step rendering
 
@@ -71,7 +75,7 @@ const readableOperation: {[key in Operator]: string} = {
   [Operator.isInMoreThan]: 'will expire in more than',
 }
 
-const renderApiError = (errorCode: string, errorMessage: string, color: typeof chalk) => {
+const renderApiError = (errorCode: string, errorMessage: string, color: chalk.Chalk) => {
   if (errorCode === 'INCORRECT_ASSERTION') {
     try {
       const assertionsErrors: Assertion[] = JSON.parse(errorMessage)
@@ -95,20 +99,20 @@ const renderApiError = (errorCode: string, errorMessage: string, color: typeof c
 }
 
 // Test execution rendering
-const renderResultOutcome = (result: Result, test: Test, icon: string, color: typeof chalk) => {
+const renderResultOutcome = (result: Result, test: Test, icon: string, color: chalk.Chalk) => {
   if (result.error) {
-    return `    ${chalk.bold(`✖ | ${result.error}`)}`
+    return `    ${chalk.bold(`${ICONS.FAILED} | ${result.error}`)}`
   }
 
   if (result.unhealthy) {
     const errorName =
       result.errorMessage && result.errorMessage !== 'Unknown error' ? result.errorMessage : 'General Error'
 
-    return `    ${chalk.bold(`✖ | ${errorName}`)}`
+    return `    ${chalk.bold(`${ICONS.FAILED} | ${errorName}`)}`
   }
 
   if (test.type === 'api') {
-    const requestDescription = renderApiRequestDescription(test.subtype, test.config.request)
+    const requestDescription = renderApiRequestDescription(test.subtype, test.config)
 
     if (result.errorCode && result.errorMessage) {
       return [
@@ -130,7 +134,8 @@ const renderResultOutcome = (result: Result, test: Test, icon: string, color: ty
   }
 }
 
-const renderApiRequestDescription = (subType: string, request: Test['config']['request']): string => {
+const renderApiRequestDescription = (subType: string, config: Test['config']): string => {
+  const {request, steps} = config
   if (subType === 'dns') {
     const text = `Query for ${request.host}`
     if (request.dnsServer) {
@@ -144,7 +149,27 @@ const renderApiRequestDescription = (subType: string, request: Test['config']['r
     return `Host: ${request.host}:${request.port}`
   }
 
-  return `${chalk.bold(request.method)} - ${request.url}`
+  if (subType === 'multi' && steps) {
+    const stepsDescription = Object.entries(
+      steps
+        .map((step) => step.subtype)
+        .reduce((counts, type) => {
+          counts[type] = (counts[type] || 0) + 1
+
+          return counts
+        }, {} as {[key: string]: number})
+    )
+      .map(([type, count]) => `${count} ${type.toUpperCase()} test`)
+      .join(', ')
+
+    return `Multistep test containing ${stepsDescription}`
+  }
+
+  if (subType === 'http') {
+    return `${chalk.bold(request.method)} - ${request.url}`
+  }
+
+  return `${chalk.bold(subType)} test`
 }
 
 const getResultUrl = (baseUrl: string, test: Test, resultId: string) => {
@@ -162,7 +187,7 @@ const renderExecutionResult = (test: Test, execution: PollResult, baseUrl: strin
   const color = getTestResultColor(isSuccess, test.options.ci?.executionRule === ExecutionRule.NON_BLOCKING)
   const icon = isSuccess ? ICONS.SUCCESS : ICONS.FAILED
 
-  const locationName = locationNames[dc_id] || dc_id.toString()
+  const locationName = !!result.tunnel ? 'Tunneled' : locationNames[dc_id] || dc_id.toString()
   const device = test.type === 'browser' && result.device ? ` - device: ${chalk.bold(result.device.id)}` : ''
   const resultIdentification = color(`  ${icon} location: ${chalk.bold(locationName)}${device}`)
 
@@ -211,53 +236,92 @@ const getTestResultColor = (success: boolean, isNonBlocking: boolean) => {
   return chalk.bold.red
 }
 
-export const renderResults = (test: Test, results: PollResult[], baseUrl: string, locationNames: LocationsMapping) => {
-  const success = hasTestSucceeded(results)
-  const isNonBlocking = test.options.ci?.executionRule === ExecutionRule.NON_BLOCKING
+export class DefaultReporter implements Reporter {
+  private write: Writable['write']
 
-  const icon = renderResultIcon(success, isNonBlocking)
-
-  const idDisplay = `[${chalk.bold.dim(test.public_id)}]`
-  const nameColor = getTestResultColor(success, isNonBlocking)
-  const nonBlockingText = !success && isNonBlocking ? '[NON-BLOCKING]' : ''
-
-  const testResultsText = results
-    .map((r) => renderExecutionResult(test, r, baseUrl, locationNames))
-    .join('\n\n')
-    .concat('\n\n')
-
-  return [`${icon} ${idDisplay}${nonBlockingText} | ${nameColor(test.name)}`, testResultsText].join('\n')
-}
-
-// Other rendering
-export const renderTrigger = (test: Test | undefined, testId: string, config: ConfigOverride) => {
-  const idDisplay = `[${chalk.bold.dim(testId)}]`
-
-  const getMessage = () => {
-    if (!test) {
-      return chalk.red.bold(`Could not find test "${testId}"`)
-    }
-    if (config.executionRule === ExecutionRule.SKIPPED) {
-      return `>> Skipped test "${chalk.yellow.dim(test.name)}"`
-    }
-    if (test.options?.ci?.executionRule === ExecutionRule.SKIPPED) {
-      return `>> Skipped test "${chalk.yellow.dim(test.name)}" because of execution rule configuration in Datadog`
-    }
-
-    return `Trigger test "${chalk.green.bold(test.name)}"`
+  constructor(command: RunTestCommand) {
+    this.write = command.context.stdout.write.bind(command.context.stdout)
   }
 
-  return `${idDisplay} ${getMessage()}\n`
-}
+  public error(error: string) {
+    this.write(error)
+  }
 
-export const renderHeader = (timings: {startTime: number}) => {
-  const delay = (Date.now() - timings.startTime).toString()
+  public initError(errors: string[]) {
+    this.write(errors.join('\n'))
+  }
 
-  return ['\n', chalk.bold.cyan('=== REPORT ==='), `Took ${chalk.bold(delay)}ms`, '\n'].join('\n')
-}
+  public log(log: string) {
+    this.write(log)
+  }
 
-export const renderWait = (test: Test) => {
-  const idDisplay = `[${chalk.bold.dim(test.public_id)}]`
+  public reportStart(timings: {startTime: number}) {
+    const delay = (Date.now() - timings.startTime).toString()
 
-  return `${idDisplay} Waiting results for "${chalk.green.bold(test.name)}"\n`
+    this.write(['\n', chalk.bold.cyan('=== REPORT ==='), `Took ${chalk.bold(delay)}ms`, '\n'].join('\n'))
+  }
+
+  public runEnd(summary: Summary) {
+    const summaries = [
+      chalk.green(`${chalk.bold(summary.passed)} passed`),
+      chalk.red(`${chalk.bold(summary.failed)} failed`),
+    ]
+
+    if (summary.skipped) {
+      summaries.push(`${chalk.bold(summary.skipped)} skipped`)
+    }
+    if (summary.notFound) {
+      summaries.push(chalk.yellow(`${chalk.bold(summary.notFound)} not found`))
+    }
+
+    this.write(`${chalk.bold('Tests execution summary:')} ${summaries.join(', ')}\n`)
+  }
+
+  public testEnd(test: Test, results: PollResult[], baseUrl: string, locationNames: LocationsMapping) {
+    const success = hasTestSucceeded(results)
+    const isNonBlocking = test.options.ci?.executionRule === ExecutionRule.NON_BLOCKING
+
+    const icon = renderResultIcon(success, isNonBlocking)
+
+    const idDisplay = `[${chalk.bold.dim(test.public_id)}]`
+    const nameColor = getTestResultColor(success, isNonBlocking)
+    const nonBlockingText = !success && isNonBlocking ? '[NON-BLOCKING]' : ''
+
+    const testResultsText = results
+      .map((r) => renderExecutionResult(test, r, baseUrl, locationNames))
+      .join('\n\n')
+      .concat('\n\n')
+
+    this.write([`${icon} ${idDisplay}${nonBlockingText} | ${nameColor(test.name)}`, testResultsText].join('\n'))
+  }
+
+  public testTrigger(test: Test, testId: string, executionRule: ExecutionRule, config: ConfigOverride) {
+    const idDisplay = `[${chalk.bold.dim(testId)}]`
+
+    const getMessage = () => {
+      if (executionRule === ExecutionRule.SKIPPED) {
+        // Test is either skipped from datadog-ci config or from test config
+        const isSkippedByCIConfig = config.executionRule === ExecutionRule.SKIPPED
+        if (isSkippedByCIConfig) {
+          return `>> Skipped test "${chalk.yellow.dim(test.name)}"`
+        } else {
+          return `>> Skipped test "${chalk.yellow.dim(test.name)}" because of execution rule configuration in Datadog`
+        }
+      }
+
+      if (executionRule === ExecutionRule.NON_BLOCKING) {
+        return `Trigger test "${chalk.green.bold(test.name)}" (non-blocking)`
+      }
+
+      return `Trigger test "${chalk.green.bold(test.name)}"`
+    }
+
+    this.write(`${idDisplay} ${getMessage()}\n`)
+  }
+
+  public testWait(test: Test) {
+    const idDisplay = `[${chalk.bold.dim(test.public_id)}]`
+
+    this.write(`${idDisplay} Waiting results for "${chalk.green.bold(test.name)}"\n`)
+  }
 }

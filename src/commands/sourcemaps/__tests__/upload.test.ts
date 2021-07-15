@@ -1,7 +1,9 @@
 // tslint:disable: no-string-literal
 import os from 'os'
 
+import chalk from 'chalk'
 import {Cli} from 'clipanion/lib/advanced'
+import {Payload} from '../interfaces'
 import {UploadCommand} from '../upload'
 
 describe('upload', () => {
@@ -73,12 +75,57 @@ describe('upload', () => {
   describe('getApiHelper', () => {
     test('should throw an error if API key is undefined', async () => {
       process.env = {}
-      const write = jest.fn()
       const command = new UploadCommand()
-      command.context = {stdout: {write}} as any
 
-      expect(command['getApiHelper'].bind(command)).toThrow('API key is missing')
-      expect(write.mock.calls[0][0]).toContain('DATADOG_API_KEY')
+      expect(command['getApiHelper'].bind(command)).toThrow(
+        `Missing ${chalk.bold('DATADOG_API_KEY')} in your environment.`
+      )
+    })
+  })
+
+  describe('addRepositoryDataToPayloads', () => {
+    test('repository url and commit still defined without payload', async () => {
+      const command = new UploadCommand()
+      const write = jest.fn()
+      command.context = {stdout: {write}} as any
+      const payloads = new Array<Payload>({
+        cliVersion: '0.0.1',
+        minifiedFilePath: 'src/commands/sourcemaps/__tests__/fixtures/sourcemap-with-no-files/empty.min.js',
+        minifiedUrl: 'http://example/empty.min.js',
+        projectPath: '',
+        service: 'svc',
+        sourcemapPath: 'src/commands/sourcemaps/__tests__/fixtures/sourcemap-with-no-files/empty.min.js.map',
+        version: '1.2.3',
+      })
+      // The command will fetch git metadatas for the current datadog-ci repository.
+      // The `empty.min.js.map` contains no files, therefore no file payload should be set.
+      await command['addRepositoryDataToPayloads'](payloads)
+      expect(payloads[0].gitRepositoryURL).toBeDefined()
+      expect(payloads[0].gitCommitSha).toHaveLength(40)
+      expect(payloads[0].gitRepositoryPayload).toBeUndefined()
+    })
+
+    test('should include payload', async () => {
+      const command = new UploadCommand()
+      const write = jest.fn()
+      command.context = {stdout: {write}} as any
+      const payloads = new Array<Payload>({
+        cliVersion: '0.0.1',
+        minifiedFilePath: 'src/commands/sourcemaps/__tests__/fixtures/basic/common.min.js',
+        minifiedUrl: 'http://example/common.min.js',
+        projectPath: '',
+        service: 'svc',
+        sourcemapPath: 'src/commands/sourcemaps/__tests__/fixtures/basic/common.min.js.map',
+        version: '1.2.3',
+      })
+      // The command will fetch git metadatas for the current datadog-ci repository.
+      // The `common.min.js.map` contains the "git.test.ts" filename which matches a tracked filename,
+      // therefore a file payload should be set.
+      // Removing the "git.test.ts" file will break this test.
+      await command['addRepositoryDataToPayloads'](payloads)
+      expect(payloads[0].gitRepositoryURL).toBeDefined()
+      expect(payloads[0].gitCommitSha).toHaveLength(40)
+      expect(payloads[0].gitRepositoryPayload).toBeDefined()
     })
   })
 })
@@ -108,51 +155,98 @@ describe('execute', () => {
   }
 
   test('relative path with double dots', async () => {
-    const {context, code} = await runCLI('./src/commands/sourcemaps/__tests__/doesnotexist/../fixtures')
+    const {context, code} = await runCLI('./src/commands/sourcemaps/__tests__/doesnotexist/../fixtures/basic')
     const output = context.stdout.toString().split(os.EOL)
     expect(code).toBe(0)
     checkConsoleOutput(output, {
-      basePath: 'src/commands/sourcemaps/__tests__/fixtures',
+      basePath: 'src/commands/sourcemaps/__tests__/fixtures/basic',
       concurrency: 20,
       jsFilesURLs: ['https://static.com/js/common.min.js'],
       minifiedPathPrefix: 'https://static.com/js',
       projectPath: '',
       service: 'test-service',
-      sourcemapsPaths: ['src/commands/sourcemaps/__tests__/fixtures/common.min.js.map'],
+      sourcemapsPaths: ['src/commands/sourcemaps/__tests__/fixtures/basic/common.min.js.map'],
       version: '1234',
     })
   })
 
   test('relative path', async () => {
-    const {context, code} = await runCLI('./src/commands/sourcemaps/__tests__/fixtures')
+    const {context, code} = await runCLI('./src/commands/sourcemaps/__tests__/fixtures/basic')
     const output = context.stdout.toString().split(os.EOL)
     expect(code).toBe(0)
     checkConsoleOutput(output, {
-      basePath: 'src/commands/sourcemaps/__tests__/fixtures',
+      basePath: 'src/commands/sourcemaps/__tests__/fixtures/basic',
       concurrency: 20,
       jsFilesURLs: ['https://static.com/js/common.min.js'],
       minifiedPathPrefix: 'https://static.com/js',
       projectPath: '',
       service: 'test-service',
-      sourcemapsPaths: ['src/commands/sourcemaps/__tests__/fixtures/common.min.js.map'],
+      sourcemapsPaths: ['src/commands/sourcemaps/__tests__/fixtures/basic/common.min.js.map'],
       version: '1234',
     })
   })
 
   test('absolute path', async () => {
-    const {context, code} = await runCLI(process.cwd() + '/src/commands/sourcemaps/__tests__/fixtures')
+    const {context, code} = await runCLI(process.cwd() + '/src/commands/sourcemaps/__tests__/fixtures/basic')
     const output = context.stdout.toString().split(os.EOL)
     expect(code).toBe(0)
     checkConsoleOutput(output, {
-      basePath: `${process.cwd()}/src/commands/sourcemaps/__tests__/fixtures`,
+      basePath: `${process.cwd()}/src/commands/sourcemaps/__tests__/fixtures/basic`,
       concurrency: 20,
       jsFilesURLs: ['https://static.com/js/common.min.js'],
       minifiedPathPrefix: 'https://static.com/js',
       projectPath: '',
       service: 'test-service',
-      sourcemapsPaths: [`${process.cwd()}/src/commands/sourcemaps/__tests__/fixtures/common.min.js.map`],
+      sourcemapsPaths: [`${process.cwd()}/src/commands/sourcemaps/__tests__/fixtures/basic/common.min.js.map`],
       version: '1234',
     })
+  })
+
+  test('using the mjs extension', async () => {
+    const {context, code} = await runCLI('./src/commands/sourcemaps/__tests__/mjs')
+    const output = context.stdout.toString().split(os.EOL)
+    expect(code).toBe(0)
+    checkConsoleOutput(output, {
+      basePath: 'src/commands/sourcemaps/__tests__/mjs',
+      concurrency: 20,
+      jsFilesURLs: ['https://static.com/js/common.mjs'],
+      minifiedPathPrefix: 'https://static.com/js',
+      projectPath: '',
+      service: 'test-service',
+      sourcemapsPaths: ['src/commands/sourcemaps/__tests__/mjs/common.mjs.map'],
+      version: '1234',
+    })
+  })
+
+  test('all files are skipped', async () => {
+    const {context, code} = await runCLI('./src/commands/sourcemaps/__tests__/fixtures/stdout-output/all-skipped')
+    const output = context.stdout.toString().split(os.EOL)
+    expect(code).toBe(0)
+    output.reverse()
+    expect(output[3]).toContain('Some sourcemaps have been skipped')
+    expect(output[2]).toContain('Details about the 2 found sourcemaps:')
+    expect(output[1]).toContain('  * 2 sourcemaps were skipped')
+  })
+
+  test('mix of skipped filed and correct files', async () => {
+    const {context, code} = await runCLI('./src/commands/sourcemaps/__tests__/fixtures/stdout-output/mixed')
+    const output = context.stdout.toString().split(os.EOL)
+    expect(code).toBe(0)
+    output.reverse()
+    expect(output[4]).toContain('Some sourcemaps have been skipped')
+    expect(output[3]).toContain('Details about the 3 found sourcemaps:')
+    expect(output[2]).toContain('  * 2 sourcemaps successfully uploaded')
+    expect(output[1]).toContain('  * 1 sourcemap was skipped')
+  })
+
+  test('completely empty sourcemap should be skipped', async () => {
+    const {context, code} = await runCLI('./src/commands/sourcemaps/__tests__/fixtures/empty-file/')
+    const output = context.stdout.toString().split(os.EOL)
+    expect(code).toBe(0)
+    output.reverse()
+    expect(output[3]).toContain('Some sourcemaps have been skipped')
+    expect(output[2]).toContain('Details about the 2 found sourcemaps:')
+    expect(output[1]).toContain('  * 2 sourcemaps were skipped')
   })
 })
 
@@ -195,7 +289,7 @@ const checkConsoleOutput = (output: string[], expected: ExpectedOutput) => {
   expect(output[4]).toContain(
     `version: ${expected.version} service: ${expected.service} project path: ${expected.projectPath}`
   )
-  const uploadedFileLines = output.slice(5, -2)
+  const uploadedFileLines = output.slice(5, -4)
   expect(expected.sourcemapsPaths.length).toEqual(uploadedFileLines.length) // Safety check
   expect(expected.jsFilesURLs.length).toEqual(uploadedFileLines.length) // Safety check
   uploadedFileLines.forEach((_, index) => {
@@ -203,5 +297,9 @@ const checkConsoleOutput = (output: string[], expected: ExpectedOutput) => {
       `[DRYRUN] Uploading sourcemap ${expected.sourcemapsPaths} for JS file available at ${expected.jsFilesURLs}`
     )
   })
-  expect(output.slice(-2, -1)[0]).toContain(`Uploaded ${uploadedFileLines.length} files`)
+  if (uploadedFileLines.length > 1) {
+    expect(output.slice(-2, -1)[0]).toContain(`[DRYRUN] Handled ${uploadedFileLines.length} sourcemaps with success`)
+  } else {
+    expect(output.slice(-2, -1)[0]).toContain(`[DRYRUN] Handled ${uploadedFileLines.length} sourcemap with success`)
+  }
 }

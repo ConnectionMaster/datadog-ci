@@ -27,13 +27,13 @@ jobs:
       - name: Install node
         uses: actions/setup-node@v1
         with:
-          node-version: '12.x'
-      - run: yarn install
+          node-version: '10.24.1'
+      - run: yarn install --immutable
       - run: yarn build
-      - run: yarn prettier-check
       - run: yarn lint
       - run: yarn test
         env:
+          CI: true
           DD_SERVICE: datadog-ci-tests
       - run: mkdir artifacts
       - run: yarn pack --filename artifacts/datadog-ci.tgz

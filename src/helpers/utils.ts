@@ -16,13 +16,18 @@ export const pick = <T extends object, K extends keyof T>(base: T, keys: K[]) =>
   return pickedObject
 }
 
-export const parseConfigFile = async <T>(baseConfig: T, configPath?: string) => {
+export const getConfig = async (configPath: string) => {
+  const configFile = await promisify(fs.readFile)(configPath, 'utf-8')
+
+  return JSON.parse(configFile)
+}
+
+export const parseConfigFile = async <T>(baseConfig: T, configPath?: string): Promise<T> => {
   try {
     const resolvedConfigPath = configPath ?? 'datadog-ci.json'
-    const configFile = await promisify(fs.readFile)(resolvedConfigPath, 'utf-8')
-    const parsedConfig = JSON.parse(configFile)
+    const parsedConfig = await getConfig(resolvedConfigPath)
 
-    return deepExtend(baseConfig, parsedConfig) as T
+    return deepExtend(baseConfig, parsedConfig)
   } catch (e) {
     if (e.code === 'ENOENT' && configPath) {
       throw new Error('Config file not found')
@@ -60,6 +65,18 @@ export interface ProxyConfiguration {
   protocol: ProxyType
 }
 
+export const getProxyUrl = (options: ProxyConfiguration) => {
+  const {auth, host, port, protocol} = options
+
+  if (!host || !port) {
+    return ''
+  }
+
+  const authFragment = auth ? `${auth.username}:${auth.password}@` : ''
+
+  return `${protocol}://${authFragment}${host}:${port}`
+}
+
 export interface RequestOptions {
   apiKey: string
   appKey?: string
@@ -81,7 +98,8 @@ export const getRequestBuilder = (options: RequestOptions) => {
     }
 
     if (proxyOpts && proxyOpts.host && proxyOpts.port) {
-      newArguments.httpsAgent = new ProxyAgent(proxyOpts)
+      const proxyUrl = getProxyUrl(proxyOpts)
+      newArguments.httpsAgent = new ProxyAgent(proxyUrl)
     }
 
     return newArguments
@@ -108,3 +126,21 @@ export const getApiHostForSite = (site: string) => {
       return `api.${site}`
   }
 }
+
+// The buildPath function is used to concatenate several paths. The goal is to have a function working for both unix
+// paths and URL whereas standard path.join does not work with both.
+export const buildPath = (...args: string[]) =>
+  args
+    .map((part, i) => {
+      if (i === 0) {
+        // For the first part, drop all / at the end of the path
+        return part.trim().replace(/[\/]*$/g, '')
+      } else {
+        // For the following parts, remove all / at the beginning and at the end
+        return part.trim().replace(/(^[\/]*|[\/]*$)/g, '')
+      }
+    })
+    // Filter out emtpy parts
+    .filter((x) => x.length)
+    // Join all these parts with /
+    .join('/')

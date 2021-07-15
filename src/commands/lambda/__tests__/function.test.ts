@@ -1,7 +1,16 @@
 jest.mock('../loggroup')
 
 import {Lambda} from 'aws-sdk'
-import {getLambdaConfigs, updateLambdaConfigs} from '../function'
+import {
+  FLUSH_TO_LOG_ENV_VAR,
+  GOVCLOUD_LAYER_AWS_ACCOUNT,
+  LAMBDA_HANDLER_ENV_VAR,
+  LOG_LEVEL_ENV_VAR,
+  MERGE_XRAY_TRACES_ENV_VAR,
+  SITE_ENV_VAR,
+  TRACE_ENABLED_ENV_VAR,
+} from '../constants'
+import {calculateUpdateRequest, getExtensionArn, getLambdaConfigs, getLayerArn, updateLambdaConfigs} from '../function'
 import * as loggroup from '../loggroup'
 
 const makeMockLambda = (functionConfigs: Record<string, Lambda.FunctionConfiguration>) => ({
@@ -14,9 +23,18 @@ const makeMockLambda = (functionConfigs: Record<string, Lambda.FunctionConfigura
 })
 
 const makeMockCloudWatchLogs = () => ({})
-
+const mockAwsAccount = '123456789012'
 describe('function', () => {
   describe('getLambdaConfigs', () => {
+    const OLD_ENV = process.env
+    beforeEach(() => {
+      jest.resetModules()
+      process.env = {}
+    })
+    afterAll(() => {
+      process.env = OLD_ENV
+    })
+
     test('returns the update request for each function', async () => {
       const lambda = makeMockLambda({
         'arn:aws:lambda:us-east-1:000000000000:function:autoinstrument': {
@@ -29,6 +47,7 @@ describe('function', () => {
       const settings = {
         flushMetricsToLogs: false,
         layerVersion: 22,
+        logLevel: 'debug',
         mergeXrayTraces: false,
         tracingEnabled: false,
       }
@@ -46,7 +65,9 @@ describe('function', () => {
             "Variables": Object {
               "DD_FLUSH_TO_LOG": "false",
               "DD_LAMBDA_HANDLER": "index.handler",
+              "DD_LOG_LEVEL": "debug",
               "DD_MERGE_XRAY_TRACES": "false",
+              "DD_SITE": "datadoghq.com",
               "DD_TRACE_ENABLED": "false",
             },
           },
@@ -64,10 +85,12 @@ describe('function', () => {
         'arn:aws:lambda:us-east-1:000000000000:function:autoinstrument': {
           Environment: {
             Variables: {
-              DD_FLUSH_TO_LOG: 'false',
-              DD_LAMBDA_HANDLER: 'index.handler',
-              DD_MERGE_XRAY_TRACES: 'false',
-              DD_TRACE_ENABLED: 'false',
+              [FLUSH_TO_LOG_ENV_VAR]: 'false',
+              [LAMBDA_HANDLER_ENV_VAR]: 'index.handler',
+              [LOG_LEVEL_ENV_VAR]: 'debug',
+              [MERGE_XRAY_TRACES_ENV_VAR]: 'false',
+              [SITE_ENV_VAR]: 'datadoghq.com',
+              [TRACE_ENABLED_ENV_VAR]: 'false',
             },
           },
           FunctionArn: 'arn:aws:lambda:us-east-1:000000000000:function:autoinstrument',
@@ -81,7 +104,7 @@ describe('function', () => {
       const settings = {
         flushMetricsToLogs: false,
         layerVersion: 22,
-
+        logLevel: 'debug',
         mergeXrayTraces: false,
         tracingEnabled: false,
       }
@@ -128,6 +151,7 @@ describe('function', () => {
                       ]
                 `)
     })
+
     test('uses the GovCloud lambda layer when a GovCloud region is detected', async () => {
       const lambda = makeMockLambda({
         'arn:aws-us-gov:lambda:us-gov-east-1:000000000000:function:autoinstrument': {
@@ -156,6 +180,7 @@ describe('function', () => {
                       ]
                 `)
     })
+
     test('returns results for multiple functions', async () => {
       const lambda = makeMockLambda({
         'arn:aws:lambda:us-east-1:000000000000:function:another-func': {
@@ -248,7 +273,17 @@ describe('function', () => {
             `)
     })
   })
+
   describe('updateLambdaConfigs', () => {
+    const OLD_ENV = process.env
+    beforeEach(() => {
+      jest.resetModules()
+      process.env = {}
+    })
+    afterAll(() => {
+      process.env = OLD_ENV
+    })
+
     test('updates every lambda', async () => {
       const lambda = makeMockLambda({})
       const configs = [
@@ -259,13 +294,13 @@ describe('function', () => {
             Handler: 'index.handler',
             Runtime: 'nodejs12.x',
           },
-          layerARN: 'arn:aws:lambda:us-east-1:464622532012:layer:Datadog-Node12-x',
+          lambdaLibraryLayerArn: 'arn:aws:lambda:us-east-1:464622532012:layer:Datadog-Node12-x',
           updateRequest: {
             Environment: {
               Variables: {
-                DD_LAMBDA_HANDLER: 'index.handler',
-                DD_MERGE_XRAY_TRACES: 'false',
-                DD_TRACE_ENABLED: 'false',
+                [LAMBDA_HANDLER_ENV_VAR]: 'index.handler',
+                [MERGE_XRAY_TRACES_ENV_VAR]: 'false',
+                [TRACE_ENABLED_ENV_VAR]: 'false',
               },
             },
             FunctionName: 'arn:aws:lambda:us-east-1:000000000000:function:autoinstrument',
@@ -280,15 +315,367 @@ describe('function', () => {
       expect(lambda.updateFunctionConfiguration).toHaveBeenCalledWith({
         Environment: {
           Variables: {
-            DD_LAMBDA_HANDLER: 'index.handler',
-            DD_MERGE_XRAY_TRACES: 'false',
-            DD_TRACE_ENABLED: 'false',
+            [LAMBDA_HANDLER_ENV_VAR]: 'index.handler',
+            [MERGE_XRAY_TRACES_ENV_VAR]: 'false',
+            [TRACE_ENABLED_ENV_VAR]: 'false',
           },
         },
         FunctionName: 'arn:aws:lambda:us-east-1:000000000000:function:autoinstrument',
         Handler: '/opt/nodejs/node_modules/datadog-lambda-js/handler.handler',
         Layers: ['arn:aws:lambda:us-east-1:464622532012:layer:Datadog-Node12-x:22'],
       })
+    })
+  })
+
+  describe('getLayerArn', () => {
+    const OLD_ENV = process.env
+    beforeEach(() => {
+      jest.resetModules()
+      process.env = {}
+    })
+    afterAll(() => {
+      process.env = OLD_ENV
+    })
+
+    test('gets sa-east-1 Node12 Lambda Library layer ARN', async () => {
+      const runtime = 'nodejs12.x'
+      const settings = {
+        flushMetricsToLogs: false,
+        layerAWSAccount: mockAwsAccount,
+        mergeXrayTraces: false,
+        tracingEnabled: false,
+      }
+      const region = 'sa-east-1'
+      const layerArn = getLayerArn(runtime, settings, region)
+      expect(layerArn).toEqual(`arn:aws:lambda:${region}:${mockAwsAccount}:layer:Datadog-Node12-x`)
+    })
+
+    test('gets sa-east-1 Python37 gov cloud Lambda Library layer ARN', async () => {
+      const runtime = 'python3.7'
+      const settings = {
+        flushMetricsToLogs: false,
+        layerAWSAccount: mockAwsAccount,
+        mergeXrayTraces: false,
+        tracingEnabled: false,
+      }
+      const region = 'us-gov-1'
+      const layerArn = getLayerArn(runtime, settings, region)
+      expect(layerArn).toEqual(`arn:aws-us-gov:lambda:${region}:${GOVCLOUD_LAYER_AWS_ACCOUNT}:layer:Datadog-Python37`)
+    })
+  })
+
+  describe('getExtensionArn', () => {
+    const OLD_ENV = process.env
+    beforeEach(() => {
+      jest.resetModules()
+      process.env = {}
+    })
+    afterAll(() => {
+      process.env = OLD_ENV
+    })
+
+    test('gets sa-east-1 Lambda Extension layer ARN', async () => {
+      const settings = {
+        flushMetricsToLogs: false,
+        layerAWSAccount: mockAwsAccount,
+        mergeXrayTraces: false,
+        tracingEnabled: false,
+      }
+      const region = 'sa-east-1'
+      const layerArn = getExtensionArn(settings, region)
+      expect(layerArn).toEqual(`arn:aws:lambda:${region}:${mockAwsAccount}:layer:Datadog-Extension`)
+    })
+
+    test('gets sa-east-1 gov cloud Lambda Extension layer ARN', async () => {
+      const settings = {
+        flushMetricsToLogs: false,
+        layerAWSAccount: mockAwsAccount,
+        mergeXrayTraces: false,
+        tracingEnabled: false,
+      }
+      const region = 'us-gov-1'
+      const layerArn = getExtensionArn(settings, region)
+      expect(layerArn).toEqual(`arn:aws-us-gov:lambda:${region}:${GOVCLOUD_LAYER_AWS_ACCOUNT}:layer:Datadog-Extension`)
+    })
+  })
+
+  describe('calculateUpdateRequest', () => {
+    const OLD_ENV = process.env
+    beforeEach(() => {
+      jest.resetModules()
+      process.env = {}
+    })
+    afterAll(() => {
+      process.env = OLD_ENV
+    })
+
+    test('calculates an update request with just lambda library layers', () => {
+      const config = {
+        FunctionArn: 'arn:aws:lambda:us-east-1:123456789012:function:lambda-hello-world',
+        Handler: 'index.handler',
+        Layers: [],
+      }
+      const settings = {
+        flushMetricsToLogs: false,
+        layerAWSAccount: mockAwsAccount,
+        layerVersion: 5,
+        mergeXrayTraces: false,
+        tracingEnabled: false,
+      }
+      const lambdaLibraryLayerArn = `arn:aws:lambda:sa-east-1:${mockAwsAccount}:layer:Datadog-Node12-x`
+      const lambdaExtensionLayerArn = `arn:aws:lambda:sa-east-1:${mockAwsAccount}:layer:Datadog-Extension`
+      const runtime = 'nodejs12.x'
+
+      const updateRequest = calculateUpdateRequest(
+        config,
+        settings,
+        lambdaLibraryLayerArn,
+        lambdaExtensionLayerArn,
+        runtime
+      )
+      expect(updateRequest).toMatchInlineSnapshot(`
+        Object {
+          "Environment": Object {
+            "Variables": Object {
+              "DD_FLUSH_TO_LOG": "false",
+              "DD_LAMBDA_HANDLER": "index.handler",
+              "DD_MERGE_XRAY_TRACES": "false",
+              "DD_SITE": "datadoghq.com",
+              "DD_TRACE_ENABLED": "false",
+            },
+          },
+          "FunctionName": "arn:aws:lambda:us-east-1:123456789012:function:lambda-hello-world",
+          "Handler": "/opt/nodejs/node_modules/datadog-lambda-js/handler.handler",
+          "Layers": Array [
+            "arn:aws:lambda:sa-east-1:123456789012:layer:Datadog-Node12-x:5",
+          ],
+        }
+      `)
+    })
+
+    test('calculates an update request with a lambda library, extension, and DATADOG_API_KEY', () => {
+      process.env.DATADOG_API_KEY = '1234'
+      const config = {
+        FunctionArn: 'arn:aws:lambda:us-east-1:123456789012:function:lambda-hello-world',
+        Handler: 'index.handler',
+        Layers: [],
+      }
+      const settings = {
+        extensionVersion: 6,
+        flushMetricsToLogs: false,
+        layerAWSAccount: mockAwsAccount,
+        layerVersion: 5,
+        mergeXrayTraces: false,
+        tracingEnabled: false,
+      }
+      const lambdaLibraryLayerArn = `arn:aws:lambda:sa-east-1:${mockAwsAccount}:layer:Datadog-Node12-x`
+      const lambdaExtensionLayerArn = `arn:aws:lambda:sa-east-1:${mockAwsAccount}:layer:Datadog-Extension`
+      const runtime = 'nodejs12.x'
+
+      const updateRequest = calculateUpdateRequest(
+        config,
+        settings,
+        lambdaLibraryLayerArn,
+        lambdaExtensionLayerArn,
+        runtime
+      )
+      expect(updateRequest).toMatchInlineSnapshot(`
+        Object {
+          "Environment": Object {
+            "Variables": Object {
+              "DD_API_KEY": "1234",
+              "DD_FLUSH_TO_LOG": "false",
+              "DD_LAMBDA_HANDLER": "index.handler",
+              "DD_MERGE_XRAY_TRACES": "false",
+              "DD_SITE": "datadoghq.com",
+              "DD_TRACE_ENABLED": "false",
+            },
+          },
+          "FunctionName": "arn:aws:lambda:us-east-1:123456789012:function:lambda-hello-world",
+          "Handler": "/opt/nodejs/node_modules/datadog-lambda-js/handler.handler",
+          "Layers": Array [
+            "arn:aws:lambda:sa-east-1:123456789012:layer:Datadog-Extension:6",
+            "arn:aws:lambda:sa-east-1:123456789012:layer:Datadog-Node12-x:5",
+          ],
+        }
+      `)
+    })
+
+    test('calculates an update request with a lambda library, extension, and DATADOG_KMS_API_KEY', () => {
+      process.env.DATADOG_KMS_API_KEY = '5678'
+      const config = {
+        FunctionArn: 'arn:aws:lambda:us-east-1:123456789012:function:lambda-hello-world',
+        Handler: 'index.handler',
+        Layers: [],
+      }
+      const settings = {
+        extensionVersion: 6,
+        flushMetricsToLogs: false,
+        layerAWSAccount: mockAwsAccount,
+        layerVersion: 5,
+        mergeXrayTraces: false,
+        tracingEnabled: false,
+      }
+      const lambdaLibraryLayerArn = `arn:aws:lambda:sa-east-1:${mockAwsAccount}:layer:Datadog-Python36`
+      const lambdaExtensionLayerArn = `arn:aws:lambda:sa-east-1:${mockAwsAccount}:layer:Datadog-Extension`
+      const runtime = 'python3.6'
+
+      const updateRequest = calculateUpdateRequest(
+        config,
+        settings,
+        lambdaLibraryLayerArn,
+        lambdaExtensionLayerArn,
+        runtime
+      )
+      expect(updateRequest).toMatchInlineSnapshot(`
+        Object {
+          "Environment": Object {
+            "Variables": Object {
+              "DD_FLUSH_TO_LOG": "false",
+              "DD_KMS_API_KEY": "5678",
+              "DD_LAMBDA_HANDLER": "index.handler",
+              "DD_MERGE_XRAY_TRACES": "false",
+              "DD_SITE": "datadoghq.com",
+              "DD_TRACE_ENABLED": "false",
+            },
+          },
+          "FunctionName": "arn:aws:lambda:us-east-1:123456789012:function:lambda-hello-world",
+          "Handler": "datadog_lambda.handler.handler",
+          "Layers": Array [
+            "arn:aws:lambda:sa-east-1:123456789012:layer:Datadog-Extension:6",
+            "arn:aws:lambda:sa-east-1:123456789012:layer:Datadog-Python36:5",
+          ],
+        }
+      `)
+    })
+
+    test('by default calculates an update request with DATADOG_SITE being set to datadoghq.com', () => {
+      const config = {
+        FunctionArn: 'arn:aws:lambda:us-east-1:123456789012:function:lambda-hello-world',
+        Handler: 'index.handler',
+        Layers: [],
+      }
+      const settings = {
+        flushMetricsToLogs: false,
+        layerAWSAccount: mockAwsAccount,
+        mergeXrayTraces: false,
+        tracingEnabled: false,
+      }
+      const lambdaLibraryLayerArn = `arn:aws:lambda:sa-east-1:${mockAwsAccount}:layer:Datadog-Python36`
+      const lambdaExtensionLayerArn = `arn:aws:lambda:sa-east-1:${mockAwsAccount}:layer:Datadog-Extension`
+      const runtime = 'python3.6'
+
+      const updateRequest = calculateUpdateRequest(
+        config,
+        settings,
+        lambdaLibraryLayerArn,
+        lambdaExtensionLayerArn,
+        runtime
+      )
+      expect(updateRequest).toMatchInlineSnapshot(`
+        Object {
+          "Environment": Object {
+            "Variables": Object {
+              "DD_FLUSH_TO_LOG": "false",
+              "DD_LAMBDA_HANDLER": "index.handler",
+              "DD_MERGE_XRAY_TRACES": "false",
+              "DD_SITE": "datadoghq.com",
+              "DD_TRACE_ENABLED": "false",
+            },
+          },
+          "FunctionName": "arn:aws:lambda:us-east-1:123456789012:function:lambda-hello-world",
+          "Handler": "datadog_lambda.handler.handler",
+        }
+      `)
+    })
+
+    test('calculates an update request with DATADOG_SITE being set to datadoghq.eu', () => {
+      process.env.DATADOG_SITE = 'datadoghq.eu'
+      const config = {
+        FunctionArn: 'arn:aws:lambda:us-east-1:123456789012:function:lambda-hello-world',
+        Handler: 'index.handler',
+        Layers: [],
+      }
+      const settings = {
+        flushMetricsToLogs: false,
+        layerAWSAccount: mockAwsAccount,
+        mergeXrayTraces: false,
+        tracingEnabled: false,
+      }
+      const lambdaLibraryLayerArn = `arn:aws:lambda:sa-east-1:${mockAwsAccount}:layer:Datadog-Python36`
+      const lambdaExtensionLayerArn = `arn:aws:lambda:sa-east-1:${mockAwsAccount}:layer:Datadog-Extension`
+      const runtime = 'python3.6'
+
+      const updateRequest = calculateUpdateRequest(
+        config,
+        settings,
+        lambdaLibraryLayerArn,
+        lambdaExtensionLayerArn,
+        runtime
+      )
+      expect(updateRequest).toMatchInlineSnapshot(`
+        Object {
+          "Environment": Object {
+            "Variables": Object {
+              "DD_FLUSH_TO_LOG": "false",
+              "DD_LAMBDA_HANDLER": "index.handler",
+              "DD_MERGE_XRAY_TRACES": "false",
+              "DD_SITE": "datadoghq.eu",
+              "DD_TRACE_ENABLED": "false",
+            },
+          },
+          "FunctionName": "arn:aws:lambda:us-east-1:123456789012:function:lambda-hello-world",
+          "Handler": "datadog_lambda.handler.handler",
+        }
+      `)
+    })
+
+    test('throws an error when an invalid DATADOG_SITE url is given', () => {
+      process.env.DATADOG_SITE = 'datacathq.eu'
+      const config = {
+        FunctionArn: 'arn:aws:lambda:us-east-1:123456789012:function:lambda-hello-world',
+        Handler: 'index.handler',
+        Layers: [],
+      }
+      const settings = {
+        flushMetricsToLogs: false,
+        layerAWSAccount: mockAwsAccount,
+        layerVersion: 5,
+        mergeXrayTraces: false,
+        tracingEnabled: false,
+      }
+      const lambdaLibraryLayerArn = `arn:aws:lambda:sa-east-1:${mockAwsAccount}:layer:Datadog-Python36`
+      const lambdaExtensionLayerArn = `arn:aws:lambda:sa-east-1:${mockAwsAccount}:layer:Datadog-Extension`
+      const runtime = 'python3.6'
+
+      expect(() => {
+        calculateUpdateRequest(config, settings, lambdaLibraryLayerArn, lambdaExtensionLayerArn, runtime)
+      }).toThrowError(
+        'Warning: Invalid site URL. Must be either datadoghq.com, datadoghq.eu, us3.datadoghq.com, or ddog-gov.com.'
+      )
+    })
+
+    test('throws an error when neither DATADOG_API_KEY nor DATADOG_KMS_API_KEY are given through the environment while using extensionVersion', () => {
+      const config = {
+        FunctionArn: 'arn:aws:lambda:us-east-1:123456789012:function:lambda-hello-world',
+        Handler: 'index.handler',
+        Layers: [],
+      }
+      const settings = {
+        extensionVersion: 6,
+        flushMetricsToLogs: false,
+        layerAWSAccount: mockAwsAccount,
+        layerVersion: 5,
+        mergeXrayTraces: false,
+        tracingEnabled: false,
+      }
+      const lambdaLibraryLayerArn = `arn:aws:lambda:sa-east-1:${mockAwsAccount}:layer:Datadog-Python36`
+      const lambdaExtensionLayerArn = `arn:aws:lambda:sa-east-1:${mockAwsAccount}:layer:Datadog-Extension`
+      const runtime = 'python3.6'
+
+      expect(() => {
+        calculateUpdateRequest(config, settings, lambdaLibraryLayerArn, lambdaExtensionLayerArn, runtime)
+      }).toThrowError("When 'extensionLayer' is set, DATADOG_API_KEY or DATADOG_KMS_API_KEY must also be set")
     })
   })
 })

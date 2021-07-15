@@ -3,7 +3,7 @@ import {AxiosError, AxiosResponse, default as axios} from 'axios'
 import {ProxyConfiguration} from '../../../helpers/utils'
 
 import {apiConstructor} from '../api'
-import {Payload, PollResult, Result, Trigger} from '../interfaces'
+import {ExecutionRule, PollResult, Result, TestPayload, Trigger} from '../interfaces'
 
 import {getApiTest} from './fixtures'
 
@@ -46,6 +46,9 @@ describe('dd-api', () => {
     ],
     triggered_check_ids: [TRIGGERED_TEST_ID],
   }
+  const PRESIGNED_URL_PAYLOAD = {
+    url: 'wss://presigned.url',
+  }
 
   test('should get results from api', async () => {
     jest.spyOn(axios, 'create').mockImplementation((() => () => ({data: POLL_RESULTS})) as any)
@@ -59,8 +62,8 @@ describe('dd-api', () => {
     jest.spyOn(axios, 'create').mockImplementation((() => () => ({data: TRIGGER_RESULTS})) as any)
     const api = apiConstructor(apiConfiguration)
     const {triggerTests} = api
-    const testsToTrigger: Payload[] = [{public_id: TRIGGERED_TEST_ID}]
-    const {results, triggered_check_ids} = await triggerTests(testsToTrigger)
+    const tests: TestPayload[] = [{public_id: TRIGGERED_TEST_ID, executionRule: ExecutionRule.BLOCKING}]
+    const {results, triggered_check_ids} = await triggerTests({tests})
     expect(triggered_check_ids).toEqual([TRIGGERED_TEST_ID])
     expect(results[0].public_id).toBe(TRIGGERED_TEST_ID)
     expect(results[0].result_id).toBe(RESULT_ID)
@@ -83,5 +86,13 @@ describe('dd-api', () => {
       // Empty catch as it is expected to throw
     }
     expect(requestMock).toHaveBeenCalledTimes(4)
+  })
+
+  test('shoud get a presigned URL from api', async () => {
+    jest.spyOn(axios, 'create').mockImplementation((() => () => ({data: PRESIGNED_URL_PAYLOAD})) as any)
+    const api = apiConstructor(apiConfiguration)
+    const {getPresignedURL} = api
+    const {url} = await getPresignedURL([TRIGGERED_TEST_ID])
+    expect(url).toEqual(PRESIGNED_URL_PAYLOAD.url)
   })
 })

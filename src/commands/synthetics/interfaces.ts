@@ -1,5 +1,6 @@
 import {Metadata} from '../../helpers/interfaces'
 import {ProxyConfiguration} from '../../helpers/utils'
+import {TunnelInfo} from './tunnel'
 
 interface Timings {
   dns: number
@@ -9,6 +10,19 @@ interface Timings {
   tcp: number
   total: number
 }
+
+export interface MainReporter {
+  error(error: string): void
+  initErrors(errors: string[]): void
+  log(log: string): void
+  reportStart(timings: {startTime: number}): void
+  runEnd(summary: Summary): void
+  testEnd(test: Test, results: PollResult[], baseUrl: string, locationNames: LocationsMapping): void
+  testTrigger(test: Test, testId: string, executionRule: ExecutionRule, config: ConfigOverride): void
+  testWait(test: Test): void
+}
+
+export type Reporter = Partial<MainReporter>
 
 export interface Result {
   device: {
@@ -22,6 +36,7 @@ export interface Result {
   passed: boolean
   stepDetails: Step[]
   timings?: Timings
+  tunnel?: boolean
   unhealthy?: boolean
 }
 
@@ -67,6 +82,7 @@ export interface Test {
       timeout: number
       url: string
     }
+    steps?: {subtype: string}[]
     variables: string[]
   }
   created_at: string
@@ -167,6 +183,7 @@ export interface ConfigOverride {
   body?: string
   bodyType?: string
   cookies?: string
+  defaultStepTimeout?: number
   deviceIds?: string[]
   executionRule?: ExecutionRule
   followRedirects?: boolean
@@ -175,11 +192,17 @@ export interface ConfigOverride {
   pollingTimeout?: number
   retry?: RetryConfig
   startUrl?: string
+  tunnel?: TunnelInfo
   variables?: {[key: string]: string}
 }
 
-export interface Payload extends ConfigOverride {
+export interface Payload {
   metadata?: Metadata
+  tests: TestPayload[]
+}
+
+export interface TestPayload extends ConfigOverride {
+  executionRule: ExecutionRule
   public_id: string
 }
 
@@ -216,6 +239,13 @@ export interface Suite {
   tests: TriggerConfig[]
 }
 
+export interface Summary {
+  failed: number
+  notFound: number
+  passed: number
+  skipped: number
+}
+
 export interface TestSearchResult {
   tests: {
     public_id: string
@@ -223,10 +253,11 @@ export interface TestSearchResult {
 }
 
 export interface APIHelper {
+  getPresignedURL(testIds: string[]): Promise<{url: string}>
   getTest(testId: string): Promise<Test>
   pollResults(resultIds: string[]): Promise<{results: PollResult[]}>
   searchTests(query: string): Promise<TestSearchResult>
-  triggerTests(testsToTrigger: Payload[]): Promise<Trigger>
+  triggerTests(payload: Payload): Promise<Trigger>
 }
 
 export interface APIConfiguration {
@@ -235,4 +266,19 @@ export interface APIConfiguration {
   baseIntakeUrl: string
   baseUrl: string
   proxyOpts: ProxyConfiguration
+}
+
+export interface CommandConfig {
+  apiKey: string
+  appKey: string
+  configPath: string
+  datadogSite: string
+  files: string[]
+  global: ConfigOverride
+  pollingTimeout: number
+  proxy: ProxyConfiguration
+  publicIds: string[]
+  subdomain: string
+  testSearchQuery?: string
+  tunnel: boolean
 }

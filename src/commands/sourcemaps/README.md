@@ -13,7 +13,7 @@ You need to have `DATADOG_API_KEY` in your environment.
 export DATADOG_API_KEY="<API KEY>"
 ```
 
-It is possible to configure the tool to use Datadog EU by defining the `DATADOG_SITE` environment variable to `datadoghq.eu`. By defaut the requests are sent to Datadog US. In order to send the usage metrics to the correct datacenter, the `DATADOG_API_HOST` must also be set if another instance of Datadog is used. For example, for Datadog EU, it should be set to `api.datadoghq.eu`.
+It is possible to configure the tool to use Datadog EU by defining the `DATADOG_SITE` environment variable to `datadoghq.eu`. By defaut the requests are sent to Datadog US.
 
 It is also possible to override the full URL for the intake endpoint by defining the `DATADOG_SOURCEMAP_INTAKE_URL` environment variable.
 
@@ -38,17 +38,17 @@ The folder structure should match the structure of the served static files.
 
 * `--release-version` (required) is similar and will be used to match the `version` tag set on the RUM SDK.
 
-* `--minified-path-prefix` (required) is the URL or absolute path prefix that will be matched against the URL we got the error from. It must be set to the actual url or the absolute path exposed on the server (and used by browsers to retrieve the minified file). 
-When un-minifying the stack traces, the URL of the static files will be matched against the concatenation of this prefix and the relative path to the folder you're uploading sourcemaps from of the JS file.
-Full URLs matching will be prioritized over absolute paths matches.
-The protocol will be ignored when matching using full URLs. The protocol can be explicitly omitted, for example: `//static.datadog.com/js`.  
-Absolute paths must always begin with a leading slash. Simply specify `/` if the content is expected to be at the root directory on the server.
+* `--minified-path-prefix` (required) should be a prefix common to all your JS source files, depending on the URL they are served from. The prefix can be a full URL or an absolute path.
+Example: if you're uploading `dist/file.js` to `https://example.com/static/file.js`, you can use `datadog-ci sourcemaps upload ./dist --minified-path-prefix https://example.com/static/` or `datadog-ci sourcemaps upload ./dist --minified-path-prefix /static/`.
+`--minified-path-prefix /` is a valid input when you upload JS at the root directory of the server.
 
 In addition, some optional parameters are available:
 
-* `--project-path` (default: empty): the path of the project on the filesystem where the sourcemaps were built. This will be stripped off from the file name in the displayed stack traces.
 * `--concurrency` (default: `20`): number of concurrent upload to the API.
+* `--disable-git` (default: false): prevents the command from sending any repository related data to Datadog (hash, remote URL and the paths within the repository of the sources referenced in the sourcemap).
 * `--dry-run` (default: `false`): it will run the command without the final step of upload. All other checks are performed.
+* `--project-path` (default: empty): the path of the project where the sourcemaps were built. This will be stripped off from sources paths referenced in the sourcemap so they can be properly matched against tracked files paths.
+* `--repository-url` (default: empty): overrides the repository remote with a custom URL. For example: https://github.com/my-company/my-project
 
 ### End-to-end testing process
 

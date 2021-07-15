@@ -1,32 +1,35 @@
 import * as fs from 'fs'
 import * as path from 'path'
-import {Writable} from 'stream'
 import {URL} from 'url'
 import {promisify} from 'util'
 
 import chalk from 'chalk'
 import glob from 'glob'
 
+import {getCIMetadata} from '../../helpers/ci'
+import {pick} from '../../helpers/utils'
+
 import {formatBackendErrors} from './api'
 import {
   APIHelper,
   ConfigOverride,
   ExecutionRule,
+  MainReporter,
   Payload,
   PollResult,
+  Reporter,
   Result,
   Suite,
+  Summary,
   TemplateContext,
   Test,
+  TestPayload,
   Trigger,
   TriggerConfig,
   TriggerResponse,
   TriggerResult,
 } from './interfaces'
-import {renderTrigger, renderWait} from './renderer'
-
-import {getCIMetadata} from '../../helpers/ci'
-import {pick} from '../../helpers/utils'
+import {Tunnel} from './tunnel'
 
 const POLLING_INTERVAL = 5000 // In ms
 const PUBLIC_ID_REGEX = /^[\d\w]{3}-[\d\w]{3}-[\d\w]{3}$/
@@ -38,10 +41,15 @@ const template = (st: string, context: any): string =>
 export const handleConfig = (
   test: Test,
   publicId: string,
-  write: Writable['write'],
+  reporter: MainReporter,
   config?: ConfigOverride
-): Payload => {
-  let handledConfig: Payload = {public_id: publicId}
+): TestPayload => {
+  const executionRule = getExecutionRule(test, config)
+  let handledConfig: TestPayload = {
+    executionRule,
+    public_id: publicId,
+  }
+
   if (!config || !Object.keys(config).length) {
     return handledConfig
   }
@@ -54,36 +62,27 @@ export const handleConfig = (
       'body',
       'bodyType',
       'cookies',
+      'defaultStepTimeout',
       'deviceIds',
       'followRedirects',
       'headers',
       'locations',
+      'pollingTimeout',
       'retry',
+      'tunnel',
       'variables',
     ]),
   }
 
-  const context = parseUrlVariables(test.config.request.url, write)
-
-  if (config.startUrl) {
+  if ((test.type === 'browser' || test.subtype === 'http') && config.startUrl) {
+    const context = parseUrlVariables(test.config.request.url, reporter)
     handledConfig.startUrl = template(config.startUrl, context)
-  }
-
-  if (config.executionRule) {
-    const executionRule = getStrictestExecutionRule(config.executionRule, test.options.ci?.executionRule)
-    test.options.ci = {...(test.options.ci || {}), executionRule}
-  }
-
-  const ciMetadata = getCIMetadata()
-
-  if (ciMetadata) {
-    handledConfig.metadata = ciMetadata
   }
 
   return handledConfig
 }
 
-const parseUrlVariables = (url: string, write: Writable['write']) => {
+const parseUrlVariables = (url: string, reporter: MainReporter) => {
   const context: TemplateContext = {
     ...process.env,
     URL: url,
@@ -92,7 +91,7 @@ const parseUrlVariables = (url: string, write: Writable['write']) => {
   try {
     objUrl = new URL(url)
   } catch {
-    write(`The start url ${url} contains variables, CI overrides will be ignored`)
+    reporter.error(`The start url ${url} contains variables, CI overrides will be ignored\n`)
 
     return context
   }
@@ -101,6 +100,7 @@ const parseUrlVariables = (url: string, write: Writable['write']) => {
   const domain = subdomainMatch ? objUrl.hostname.replace(`${subdomainMatch[1]}.`, '') : objUrl.hostname
 
   context.DOMAIN = domain
+  context.HASH = objUrl.hash
   context.HOST = objUrl.host
   context.HOSTNAME = objUrl.hostname
   context.ORIGIN = objUrl.origin
@@ -111,6 +111,14 @@ const parseUrlVariables = (url: string, write: Writable['write']) => {
   context.SUBDOMAIN = subdomainMatch ? subdomainMatch[1] : undefined
 
   return context
+}
+
+export const getExecutionRule = (test: Test, configOverride?: ConfigOverride): ExecutionRule => {
+  if (configOverride && configOverride.executionRule) {
+    return getStrictestExecutionRule(configOverride.executionRule, test.options?.ci?.executionRule)
+  }
+
+  return test.options?.ci?.executionRule || ExecutionRule.BLOCKING
 }
 
 export const getStrictestExecutionRule = (configRule: ExecutionRule, testRule?: ExecutionRule): ExecutionRule => {
@@ -144,13 +152,13 @@ export const hasResultPassed = (result: Result): boolean => {
 export const hasTestSucceeded = (results: PollResult[]): boolean =>
   results.every((pollResult: PollResult) => hasResultPassed(pollResult.result))
 
-export const getSuites = async (GLOB: string, write: Writable['write']): Promise<Suite[]> => {
-  write(`Finding files in ${path.join(process.cwd(), GLOB)}\n`)
+export const getSuites = async (GLOB: string, reporter: MainReporter): Promise<Suite[]> => {
+  reporter.log(`Finding files in ${path.join(process.cwd(), GLOB)}\n`)
   const files: string[] = await promisify(glob)(GLOB)
   if (files.length) {
-    write(`\nGot test files:\n${files.map((file) => `  - ${file}\n`).join('')}\n`)
+    reporter.log(`\nGot test files:\n${files.map((file) => `  - ${file}\n`).join('')}\n`)
   } else {
-    write('\nNo test files found.\n\n')
+    reporter.log('\nNo test files found.\n\n')
   }
 
   return Promise.all(
@@ -172,23 +180,46 @@ export const waitForResults = async (
   api: APIHelper,
   triggerResponses: TriggerResponse[],
   defaultTimeout: number,
-  triggerConfigs: TriggerConfig[]
+  triggerConfigs: TriggerConfig[],
+  tunnel?: Tunnel
 ) => {
   const triggerResultMap = createTriggerResultMap(triggerResponses, defaultTimeout, triggerConfigs)
   const triggerResults = [...triggerResultMap.values()]
 
   const maxPollingTimeout = Math.max(...triggerResults.map((tr) => tr.pollingTimeout))
   const pollingStartDate = new Date().getTime()
+
+  let isTunnelConnected = true
+  if (tunnel) {
+    tunnel
+      .keepAlive()
+      .then(() => (isTunnelConnected = false))
+      .catch(() => (isTunnelConnected = false))
+  }
   while (triggerResults.filter((tr) => !tr.result).length) {
     const pollingDuration = new Date().getTime() - pollingStartDate
 
     // Remove test which exceeded their pollingTimeout
     for (const triggerResult of triggerResults.filter((tr) => !tr.result)) {
       if (pollingDuration >= triggerResult.pollingTimeout) {
-        triggerResult.result = createTimeoutResult(
+        triggerResult.result = createFailingResult(
+          'Timeout',
           triggerResult.result_id,
           triggerResult.device,
-          triggerResult.location
+          triggerResult.location,
+          !!tunnel
+        )
+      }
+    }
+
+    if (tunnel && !isTunnelConnected) {
+      for (const triggerResult of triggerResults.filter((tr) => !tr.result)) {
+        triggerResult.result = createFailingResult(
+          'Tunnel Failure',
+          triggerResult.result_id,
+          triggerResult.device,
+          triggerResult.location,
+          !!tunnel
         )
       }
     }
@@ -207,6 +238,10 @@ export const waitForResults = async (
           triggeredResult.result = polledResult
         }
       }
+    }
+
+    if (!triggerResults.filter((tr) => !tr.result).length) {
+      break
     }
 
     await wait(POLLING_INTERVAL)
@@ -242,24 +277,88 @@ export const createTriggerResultMap = (
   return triggerResultMap
 }
 
-const createTimeoutResult = (resultId: string, deviceId: string, dcId: number): PollResult => ({
+const createFailingResult = (
+  errorMessage: string,
+  resultId: string,
+  deviceId: string,
+  dcId: number,
+  tunnel: boolean
+): PollResult => ({
   dc_id: dcId,
   result: {
     device: {id: deviceId},
-    error: 'Timeout',
+    error: errorMessage,
     eventType: 'finished',
     passed: false,
     stepDetails: [],
+    tunnel,
   },
   resultID: resultId,
 })
 
-export const runTests = async (
-  api: APIHelper,
-  triggerConfigs: TriggerConfig[],
-  write: Writable['write']
-): Promise<{tests: Test[]; triggers: Trigger}> => {
-  const testsToTrigger: Payload[] = []
+export const getReporter = (reporters: Reporter[]): MainReporter => ({
+  error: (error) => {
+    for (const reporter of reporters) {
+      if (typeof reporter.error === 'function') {
+        reporter.error(error)
+      }
+    }
+  },
+  initErrors: (errors) => {
+    for (const reporter of reporters) {
+      if (typeof reporter.initErrors === 'function') {
+        reporter.initErrors(errors)
+      }
+    }
+  },
+  log: (log) => {
+    for (const reporter of reporters) {
+      if (typeof reporter.log === 'function') {
+        reporter.log(log)
+      }
+    }
+  },
+  reportStart: (timings) => {
+    for (const reporter of reporters) {
+      if (typeof reporter.reportStart === 'function') {
+        reporter.reportStart(timings)
+      }
+    }
+  },
+  runEnd: (summary) => {
+    for (const reporter of reporters) {
+      if (typeof reporter.runEnd === 'function') {
+        reporter.runEnd(summary)
+      }
+    }
+  },
+  testEnd: (test, results, baseUrl, locationNames) => {
+    for (const reporter of reporters) {
+      if (typeof reporter.testEnd === 'function') {
+        reporter.testEnd(test, results, baseUrl, locationNames)
+      }
+    }
+  },
+  testTrigger: (test, testId, executionRule, config) => {
+    for (const reporter of reporters) {
+      if (typeof reporter.testTrigger === 'function') {
+        reporter.testTrigger(test, testId, executionRule, config)
+      }
+    }
+  },
+  testWait: (test) => {
+    for (const reporter of reporters) {
+      if (typeof reporter.testWait === 'function') {
+        reporter.testWait(test)
+      }
+    }
+  },
+})
+
+export const getTestsToTrigger = async (api: APIHelper, triggerConfigs: TriggerConfig[], reporter: MainReporter) => {
+  const overriddenTestsToTrigger: TestPayload[] = []
+  const errorMessages: string[] = []
+  const summary: Summary = {failed: 0, notFound: 0, passed: 0, skipped: 0}
 
   const tests = await Promise.all(
     triggerConfigs.map(async ({config, id}) => {
@@ -268,40 +367,46 @@ export const runTests = async (
       try {
         test = await api.getTest(id)
       } catch (e) {
+        summary.notFound++
         const errorMessage = formatBackendErrors(e)
-        write(`[${chalk.bold.dim(id)}] Test not found: ${errorMessage}\n`)
-      }
-
-      if (!test || config.executionRule === ExecutionRule.SKIPPED) {
-        write(`[${chalk.bold.dim(id)}] Test skipped as per test or global configuration.\n`)
+        errorMessages.push(`[${chalk.bold.dim(id)}] ${chalk.yellow.bold('Test not found')}: ${errorMessage}\n`)
 
         return
       }
 
-      if (test.options?.ci?.executionRule === ExecutionRule.SKIPPED) {
-        write(`[${chalk.bold.dim(id)}] Test skipped as per execution rule in Datadog.\n`)
+      const overriddenConfig = handleConfig(test, id, reporter, config)
+      overriddenTestsToTrigger.push(overriddenConfig)
 
-        return
+      reporter.testTrigger(test, id, overriddenConfig.executionRule, config)
+      if (overriddenConfig.executionRule === ExecutionRule.SKIPPED) {
+        summary.skipped++
+      } else {
+        reporter.testWait(test)
+
+        return test
       }
-
-      write(renderTrigger(test, id, config))
-      const overloadedConfig = handleConfig(test, id, write, config)
-      write(renderWait(test))
-      testsToTrigger.push(overloadedConfig)
-
-      return test
     })
   )
 
-  if (!testsToTrigger.length) {
+  // Display errors at the end of all tests for better visibility.
+  reporter.initErrors(errorMessages)
+
+  if (!overriddenTestsToTrigger.length) {
     throw new Error('No tests to trigger')
   }
 
+  return {tests: tests.filter(definedTypeGuard), overriddenTestsToTrigger, summary}
+}
+
+export const runTests = async (api: APIHelper, testsToTrigger: TestPayload[]): Promise<Trigger> => {
+  const payload: Payload = {tests: testsToTrigger}
+  const ciMetadata = getCIMetadata()
+  if (ciMetadata) {
+    payload.metadata = ciMetadata
+  }
+
   try {
-    return {
-      tests: tests.filter(definedTypeGuard),
-      triggers: await api.triggerTests(testsToTrigger),
-    }
+    return api.triggerTests(payload)
   } catch (e) {
     const errorMessage = formatBackendErrors(e)
     const testIds = testsToTrigger.map((t) => t.public_id).join(',')

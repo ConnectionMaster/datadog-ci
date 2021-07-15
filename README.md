@@ -1,6 +1,6 @@
 # Datadog CI
 
-![Continuous Integration](https://github.com/DataDog/datadog-ci/workflows/Continuous%20Integration/badge.svg) [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+![Continuous Integration](https://github.com/DataDog/datadog-ci/workflows/Continuous%20Integration/badge.svg) [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0) ![NodeJS Version](https://img.shields.io/badge/Node.js-10.24.1+-green)
 
 Execute commands with Datadog from within your Continuous Integration/Continuous Deployment scripts. A good way to perform end to end tests of your application before applying you changes or deploying. It currently features running synthetics tests and waiting for the results.
 
@@ -135,6 +135,22 @@ Releasing a new version of `datadog-ci` unfolds as follow:
 - merge the Pull Request
 - create a Github Release from the [Tags page](https://github.com/DataDog/datadog-ci/tags) with the description of changes introduced
 - Once the release has been created, a Github Action will publish the package
+
+### Pre-Release Process
+
+If you need to create a pre-release or releasing in a different channel here's how it works:
+
+- create a new branch for the channel you want to release to (`alpha`, `beta`, ...).
+- create a PR for your feature branch with the channel branch as a base.
+- pick a version following this format `version-channel`, it can be `0.10.9-alpha` or `1-beta`...
+- merge the Pull Request
+- create a [Github Release](https://github.com/DataDog/datadog-ci/releases/new?target=alpha&tag=0.10.9-alpha&prerelease=1&title=Alpha+prerelease):
+  - target the channel branch
+  - pick a tag based on your version `version-channel`
+  - check the `This is a pre-release` checkbox
+- publish the release and an action will publish it on npm
+
+<img src="./assets/pre-release.png" width="500"/>
 
 ## License
 

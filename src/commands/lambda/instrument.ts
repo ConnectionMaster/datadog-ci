@@ -12,11 +12,13 @@ export class InstrumentCommand extends Command {
   }
   private configPath?: string
   private dryRun = false
+  private extensionVersion?: string
   private flushMetricsToLogs?: boolean
   private forwarder?: string
   private functions: string[] = []
   private layerAWSAccount?: string
   private layerVersion?: string
+  private logLevel?: string
   private mergeXrayTraces?: boolean
   private region?: string
   private tracing?: boolean
@@ -40,12 +42,19 @@ export class InstrumentCommand extends Command {
       return 1
     }
 
+    if (settings.extensionVersion && settings.forwarderARN) {
+      this.context.stdout.write('"extensionVersion" and "forwarder" should not be used at the same time.\n')
+
+      return 1
+    }
+
     const configGroups: {
       cloudWatchLogs: CloudWatchLogs
       configs: FunctionConfiguration[]
       lambda: Lambda
       region: string
     }[] = []
+
     for (const [region, functionList] of Object.entries(functionGroups)) {
       const lambda = new Lambda({region})
       const cloudWatchLogs = new CloudWatchLogs({region})
@@ -58,11 +67,13 @@ export class InstrumentCommand extends Command {
         return 1
       }
     }
+
     const configList = configGroups.map((group) => group.configs).reduce((a, b) => a.concat(b))
     this.printPlannedActions(configList)
     if (this.dryRun || configList.length === 0) {
       return 0
     }
+
     const promises = Object.values(configGroups).map((group) =>
       updateLambdaConfigs(group.lambda, group.cloudWatchLogs, group.configs)
     )
@@ -113,28 +124,42 @@ export class InstrumentCommand extends Command {
 
   private getSettings(): InstrumentationSettings | undefined {
     const layerVersionStr = this.layerVersion ?? this.config.layerVersion
+    const extensionVersionStr = this.extensionVersion ?? this.config.extensionVersion
     const layerAWSAccount = this.layerAWSAccount ?? this.config.layerAWSAccount
     const forwarderARN = this.forwarder ?? this.config.forwarder
-    if (layerVersionStr === undefined) {
-      this.context.stdout.write('No layer version specified. Use -v,--layerVersion\n')
 
-      return
+    let layerVersion
+    if (layerVersionStr !== undefined) {
+      layerVersion = parseInt(layerVersionStr, 10)
     }
-    const layerVersion = parseInt(layerVersionStr, 10)
     if (Number.isNaN(layerVersion)) {
       this.context.stdout.write(`Invalid layer version ${layerVersion}.\n`)
 
       return
     }
+
+    let extensionVersion: number | undefined
+    if (extensionVersionStr !== undefined) {
+      extensionVersion = parseInt(extensionVersionStr, 10)
+    }
+    if (Number.isNaN(extensionVersion)) {
+      this.context.stdout.write(`Invalid extension version ${extensionVersion}.\n`)
+
+      return
+    }
+
     const flushMetricsToLogs = this.flushMetricsToLogs ?? this.config.flushMetricsToLogs ?? true
     const mergeXrayTraces = this.mergeXrayTraces ?? this.config.mergeXrayTraces ?? false
     const tracingEnabled = this.tracing ?? this.config.tracing ?? true
+    const logLevel = this.logLevel ?? this.config.logLevel
 
     return {
+      extensionVersion,
       flushMetricsToLogs,
       forwarderARN,
       layerAWSAccount,
       layerVersion,
+      logLevel,
       mergeXrayTraces,
       tracingEnabled,
     }
@@ -216,6 +241,7 @@ export class InstrumentCommand extends Command {
 InstrumentCommand.addPath('lambda', 'instrument')
 InstrumentCommand.addOption('functions', Command.Array('-f,--function'))
 InstrumentCommand.addOption('region', Command.String('-r,--region'))
+InstrumentCommand.addOption('extensionVersion', Command.String('-e,--extensionVersion'))
 InstrumentCommand.addOption('layerVersion', Command.String('-v,--layerVersion'))
 InstrumentCommand.addOption('layerAWSAccount', Command.String('-a,--layerAccount', {hidden: true}))
 InstrumentCommand.addOption('tracing', Command.Boolean('--tracing'))
@@ -224,3 +250,4 @@ InstrumentCommand.addOption('flushMetricsToLogs', Command.Boolean('--flushMetric
 InstrumentCommand.addOption('dryRun', Command.Boolean('-d,--dry'))
 InstrumentCommand.addOption('configPath', Command.String('--config'))
 InstrumentCommand.addOption('forwarder', Command.String('--forwarder'))
+InstrumentCommand.addOption('logLevel', Command.String('--logLevel'))

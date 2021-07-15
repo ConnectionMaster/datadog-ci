@@ -1,28 +1,41 @@
 import {CloudWatchLogs, Lambda} from 'aws-sdk'
 import {
+  API_KEY_ENV_VAR,
+  CI_API_KEY_ENV_VAR,
+  CI_KMS_API_KEY_ENV_VAR,
+  CI_SITE_ENV_VAR,
+  DD_LAMBDA_EXTENSION_LAYER_NAME,
   DEFAULT_LAYER_AWS_ACCOUNT,
+  FLUSH_TO_LOG_ENV_VAR,
   GOVCLOUD_LAYER_AWS_ACCOUNT,
   HANDLER_LOCATION,
+  KMS_API_KEY_ENV_VAR,
+  LAMBDA_HANDLER_ENV_VAR,
+  LOG_LEVEL_ENV_VAR,
+  MERGE_XRAY_TRACES_ENV_VAR,
   Runtime,
   RUNTIME_LAYER_LOOKUP,
+  SITE_ENV_VAR,
+  TRACE_ENABLED_ENV_VAR,
 } from './constants'
 import {applyLogGroupConfig, calculateLogGroupUpdateRequest, LogGroupConfiguration} from './loggroup'
 import {applyTagConfig, calculateTagUpdateRequest, TagConfiguration} from './tags'
-
 export interface FunctionConfiguration {
   functionARN: string
   lambdaConfig: Lambda.FunctionConfiguration
-  layerARN: string
+  lambdaLibraryLayerArn: string
   logGroupConfiguration?: LogGroupConfiguration
   tagConfiguration?: TagConfiguration
   updateRequest?: Lambda.UpdateFunctionConfigurationRequest
 }
 
 export interface InstrumentationSettings {
+  extensionVersion?: number
   flushMetricsToLogs: boolean
   forwarderARN?: string
   layerAWSAccount?: string
   layerVersion?: number
+  logLevel?: string
   mergeXrayTraces: boolean
   tracingEnabled: boolean
 }
@@ -45,8 +58,15 @@ export const getLambdaConfigs = async (
       throw Error(`Can't instrument ${functionARN}, runtime ${runtime} not supported`)
     }
 
-    const layerARN: string = getLayerArn(runtime, settings, region)
-    const updateRequest = calculateUpdateRequest(config, settings, layerARN, runtime)
+    const lambdaLibraryLayerArn: string = getLayerArn(runtime, settings, region)
+    const lambdaExtensionLayerArn: string = getExtensionArn(settings, region)
+    const updateRequest = calculateUpdateRequest(
+      config,
+      settings,
+      lambdaLibraryLayerArn,
+      lambdaExtensionLayerArn,
+      runtime
+    )
     let logGroupConfiguration: LogGroupConfiguration | undefined
     if (settings.forwarderARN !== undefined) {
       const arn = `/aws/lambda/${config.FunctionName}`
@@ -58,7 +78,7 @@ export const getLambdaConfigs = async (
     functionsToUpdate.push({
       functionARN,
       lambdaConfig: config,
-      layerARN,
+      lambdaLibraryLayerArn,
       logGroupConfiguration,
       tagConfiguration,
       updateRequest,
@@ -103,7 +123,7 @@ const getLambdaConfig = async (
   return {config, functionARN: resolvedFunctionARN}
 }
 
-const getLayerArn = (runtime: Runtime, settings: InstrumentationSettings, region: string) => {
+export const getLayerArn = (runtime: Runtime, settings: InstrumentationSettings, region: string) => {
   const layerName = RUNTIME_LAYER_LOOKUP[runtime]
   const account = settings.layerAWSAccount ?? DEFAULT_LAYER_AWS_ACCOUNT
   const isGovCloud = region.startsWith('us-gov')
@@ -114,15 +134,32 @@ const getLayerArn = (runtime: Runtime, settings: InstrumentationSettings, region
   return `arn:aws:lambda:${region}:${account}:layer:${layerName}`
 }
 
-const calculateUpdateRequest = (
+export const getExtensionArn = (settings: InstrumentationSettings, region: string) => {
+  const layerName = DD_LAMBDA_EXTENSION_LAYER_NAME
+  const account = settings.layerAWSAccount ?? DEFAULT_LAYER_AWS_ACCOUNT
+  const isGovCloud = region.startsWith('us-gov')
+  if (isGovCloud) {
+    return `arn:aws-us-gov:lambda:${region}:${GOVCLOUD_LAYER_AWS_ACCOUNT}:layer:${layerName}`
+  }
+
+  return `arn:aws:lambda:${region}:${account}:layer:${layerName}`
+}
+
+export const calculateUpdateRequest = (
   config: Lambda.FunctionConfiguration,
   settings: InstrumentationSettings,
-  layerARN: string,
+  lambdaLibraryLayerArn: string,
+  lambdaExtensionLayerArn: string,
   runtime: Runtime
 ) => {
-  const env: Record<string, string> = {...config.Environment?.Variables}
-  const newEnvVars: Record<string, string> = {}
+  const oldEnvVars: Record<string, string> = {...config.Environment?.Variables}
+  const changedEnvVars: Record<string, string> = {}
   const functionARN = config.FunctionArn
+
+  const apiKey: string | undefined = process.env[CI_API_KEY_ENV_VAR]
+  const apiKmsKey: string | undefined = process.env[CI_KMS_API_KEY_ENV_VAR]
+  const site: string | undefined = process.env[CI_SITE_ENV_VAR]
+
   if (functionARN === undefined) {
     return undefined
   }
@@ -132,43 +169,117 @@ const calculateUpdateRequest = (
   }
   let needsUpdate = false
 
-  if (env.DD_LAMBDA_HANDLER === undefined) {
-    needsUpdate = true
-    newEnvVars.DD_LAMBDA_HANDLER = config.Handler ?? ''
-  }
+  // Update Handler
   const expectedHandler = HANDLER_LOCATION[runtime]
   if (config.Handler !== expectedHandler) {
     needsUpdate = true
     updateRequest.Handler = HANDLER_LOCATION[runtime]
   }
-  const layerARNs = (config.Layers ?? []).map((layer) => layer.Arn ?? '')
-  const fullLayerARN = `${layerARN}:${settings.layerVersion}`
-  if (!layerARNs.includes(fullLayerARN)) {
+
+  // Update Env Vars
+  if (oldEnvVars[LAMBDA_HANDLER_ENV_VAR] === undefined) {
     needsUpdate = true
-    // Remove any other versions of the layer
-    updateRequest.Layers = [...layerARNs.filter((l) => !l.startsWith(layerARN)), fullLayerARN]
+    changedEnvVars[LAMBDA_HANDLER_ENV_VAR] = config.Handler ?? ''
   }
-  if (env.DD_TRACE_ENABLED !== settings.tracingEnabled.toString()) {
+  if (apiKey !== undefined && oldEnvVars[API_KEY_ENV_VAR] !== apiKey) {
     needsUpdate = true
-    newEnvVars.DD_TRACE_ENABLED = settings.tracingEnabled.toString()
+    changedEnvVars[API_KEY_ENV_VAR] = apiKey
   }
-  if (env.DD_MERGE_XRAY_TRACES !== settings.mergeXrayTraces.toString()) {
+  if (apiKmsKey !== undefined && oldEnvVars[KMS_API_KEY_ENV_VAR] !== apiKmsKey) {
     needsUpdate = true
-    newEnvVars.DD_MERGE_XRAY_TRACES = settings.mergeXrayTraces.toString()
+    changedEnvVars[KMS_API_KEY_ENV_VAR] = apiKmsKey
   }
-  if (env.DD_FLUSH_TO_LOG !== settings.flushMetricsToLogs.toString()) {
-    needsUpdate = true
-    newEnvVars.DD_FLUSH_TO_LOG = settings.flushMetricsToLogs.toString()
-  }
-  if (Object.entries(newEnvVars).length > 0) {
-    updateRequest.Environment = {
-      Variables: {...env, ...newEnvVars},
+  if (site !== undefined && oldEnvVars[SITE_ENV_VAR] !== site) {
+    const siteList: string[] = ['datadoghq.com', 'datadoghq.eu', 'us3.datadoghq.com', 'ddog-gov.com']
+    if (siteList.includes(site.toLowerCase())) {
+      needsUpdate = true
+      changedEnvVars[SITE_ENV_VAR] = site
+    } else {
+      throw new Error(
+        'Warning: Invalid site URL. Must be either datadoghq.com, datadoghq.eu, us3.datadoghq.com, or ddog-gov.com.'
+      )
     }
   }
+  if (site === undefined && oldEnvVars[SITE_ENV_VAR] === undefined) {
+    needsUpdate = true
+    changedEnvVars[SITE_ENV_VAR] = 'datadoghq.com'
+  }
+  if (oldEnvVars[TRACE_ENABLED_ENV_VAR] !== settings.tracingEnabled.toString()) {
+    needsUpdate = true
+    changedEnvVars[TRACE_ENABLED_ENV_VAR] = settings.tracingEnabled.toString()
+  }
+  if (oldEnvVars[MERGE_XRAY_TRACES_ENV_VAR] !== settings.mergeXrayTraces.toString()) {
+    needsUpdate = true
+    changedEnvVars[MERGE_XRAY_TRACES_ENV_VAR] = settings.mergeXrayTraces.toString()
+  }
+  if (oldEnvVars[FLUSH_TO_LOG_ENV_VAR] !== settings.flushMetricsToLogs.toString()) {
+    needsUpdate = true
+    changedEnvVars[FLUSH_TO_LOG_ENV_VAR] = settings.flushMetricsToLogs.toString()
+  }
+
+  const newEnvVars = {...oldEnvVars, ...changedEnvVars}
+
+  if (newEnvVars[LOG_LEVEL_ENV_VAR] !== settings.logLevel) {
+    needsUpdate = true
+    if (settings.logLevel) {
+      newEnvVars[LOG_LEVEL_ENV_VAR] = settings.logLevel
+    } else {
+      delete newEnvVars[LOG_LEVEL_ENV_VAR]
+    }
+  }
+
+  updateRequest.Environment = {
+    Variables: newEnvVars,
+  }
+
+  // Update Layers
+  let fullLambdaLibraryLayerARN: string | undefined
+  if (settings.layerVersion !== undefined) {
+    fullLambdaLibraryLayerARN = `${lambdaLibraryLayerArn}:${settings.layerVersion}`
+  }
+  let fullExtensionLayerARN: string | undefined
+  if (settings.extensionVersion !== undefined) {
+    fullExtensionLayerARN = `${lambdaExtensionLayerArn}:${settings.extensionVersion}`
+  }
+  let layerARNs = (config.Layers ?? []).map((layer) => layer.Arn ?? '')
+  const originalLayerARNs = (config.Layers ?? []).map((layer) => layer.Arn ?? '')
+  let needsLayerUpdate = false
+  layerARNs = addLayerARN(fullLambdaLibraryLayerARN, lambdaLibraryLayerArn, layerARNs)
+  layerARNs = addLayerARN(fullExtensionLayerARN, lambdaExtensionLayerArn, layerARNs)
+
+  if (originalLayerARNs.sort().join(',') !== layerARNs.sort().join(',')) {
+    needsLayerUpdate = true
+  }
+  if (needsLayerUpdate) {
+    needsUpdate = true
+    updateRequest.Layers = layerARNs
+  }
+
+  layerARNs.forEach((layerARN) => {
+    if (
+      layerARN.includes(DD_LAMBDA_EXTENSION_LAYER_NAME) &&
+      newEnvVars[API_KEY_ENV_VAR] === undefined &&
+      newEnvVars[KMS_API_KEY_ENV_VAR] === undefined
+    ) {
+      throw new Error(
+        `When 'extensionLayer' is set, ${CI_API_KEY_ENV_VAR} or ${CI_KMS_API_KEY_ENV_VAR} must also be set`
+      )
+    }
+  })
 
   return needsUpdate ? updateRequest : undefined
 }
 
+const addLayerARN = (fullLayerARN: string | undefined, partialLayerARN: string, layerARNs: string[]) => {
+  if (fullLayerARN) {
+    if (!layerARNs.includes(fullLayerARN)) {
+      // Remove any other versions of the layer
+      layerARNs = [...layerARNs.filter((l) => !l.startsWith(partialLayerARN)), fullLayerARN]
+    }
+  }
+
+  return layerARNs
+}
 const isSupportedRuntime = (runtime?: string): runtime is Runtime => {
   const lookup = RUNTIME_LAYER_LOOKUP as Record<string, string>
 
